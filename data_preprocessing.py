@@ -1,82 +1,121 @@
-# data_preprocessing.py
-
+import os
 import pandas as pd
 import numpy as np
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 import re
-from pathlib import Path
-from sklearn.preprocessing import LabelEncoder
-from datetime import datetime
 import joblib
-import os
+import json
+from datetime import datetime
 
-class ClinicalTrialPreprocessor:
-    def __init__(self, input_csv, output_dir="data/processed"):
-        self.raw_path = Path(input_csv)
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.label_encoders = {}
+# Paths
+raw_file = "/content/drive/MyDrive/clinical-trial-outcome-prediction/data/clinical_trials_raw.csv"
+processed_dir = "/content/drive/MyDrive/clinical-trial-outcome-prediction/data/processed"
+os.makedirs(processed_dir, exist_ok=True)
 
-    def clean_text(self, text):
-        if pd.isna(text):
-            return ""
-        text = str(text).lower()
-        text = re.sub(r'[^\w\s]', ' ', text)
-        text = ' '.join(text.split())
-        return text
+# Load raw data
+df = pd.read_csv(raw_file)
+print("Loaded raw data:", df.shape)
 
-    def create_outcome_labels(self, df):
-        success = ['Completed', 'Active, not recruiting']
-        fail = ['Terminated', 'Withdrawn', 'Suspended']
-        def label_outcome(status):
-            if status in success:
-                return 1
-            elif status in fail:
-                return 0
-            else:
-                return np.nan
-        df['outcome'] = df['statusModule.overallStatus'].apply(label_outcome)
-        df = df.dropna(subset=['outcome'])
-        return df
+# 1. Create outcome labels
+def outcome_label(status, why=None):
+    if pd.isna(status):
+        return None
+    stat = str(status).lower()
+    if any(s in stat for s in ['completed', 'active, not recruiting', 'enrolling by invitation', 'recruiting']):
+        return 1  # Success
+    if any(s in stat for s in ['terminated', 'withdrawn', 'suspended', 'no longer', 'temporarily']):
+        return 0  # Failure
+    if pd.notna(why) and str(why).strip():
+        return 0  # Any stopped with a reason = likely failure
+    return None
 
-    def process_structured(self, df):
-        df['enrollment'] = pd.to_numeric(df.get('designModule.enrollmentInfo.count', 0), errors='coerce').fillna(0)
+df['outcome'] = df.apply(lambda row: outcome_label(row.get('overall_status'), row.get('why_stopped')), axis=1)
+df = df.dropna(subset=['outcome'])
+df['outcome'] = df['outcome'].astype(int)
+print(
+    f"Prepared outcome labels (final count: {len(df)} | fail: {(df['outcome']==0).sum()}, success: {(df['outcome']==1).sum()})"
+)
 
-        for col in [
-            "designModule.studyType",
-            "designModule.designInfo.allocation",
-            "designModule.designInfo.primaryPurpose"
-        ]:
-            if col in df.columns:
-                df[col] = df[col].fillna("Unknown")
-                le = LabelEncoder()
-                df[col + "_enc"] = le.fit_transform(df[col])
-                self.label_encoders[col] = le
-        return df
+# 2. Clean and fuse text fields
+def clean(txt):
+    if pd.isna(txt):
+        return ""
+    txt = str(txt).lower()
+    txt = re.sub(r'[^\w\s]', ' ', txt)
+    txt = ' '.join(txt.split())
+    return txt
 
-    def process_text(self, df):
-        text_cols = [
-            "identificationModule.briefTitle",
-            "descriptionModule.briefSummary",
-            "descriptionModule.detailedDescription"
-        ]
-        for col in text_cols:
-            df[col] = df[col].fillna("").apply(self.clean_text)
-        df["combined_text"] = df[text_cols].apply(lambda row: " ".join(row.values), axis=1)
-        return df
+for col in ['brief_title', 'official_title', 'brief_summary', 'detailed_description', 'eligibility_criteria']:
+    if col in df.columns:
+        df[f'{col}_clean'] = df[col].apply(clean)
 
-    def run(self):
-        df = pd.read_csv(self.raw_path)
-        df = self.create_outcome_labels(df)
-        df = self.process_structured(df)
-        df = self.process_text(df)
+text_cols = [c for c in df.columns if c.endswith('_clean')]
+df['combined_text'] = df[text_cols].fillna('').agg(' '.join, axis=1)
+df['combined_text'] = df['combined_text'].str[:1000]   # Truncate if very long
 
-        output_path = self.output_dir / f"processed_trials_{self.timestamp}.csv"
-        df.to_csv(output_path, index=False)
+# 3. Numeric and categorical features
+numerical = ['enrollment_count']
+for n in numerical:
+    if n in df.columns:
+        df[n] = pd.to_numeric(df[n], errors='coerce').fillna(0)
 
-        encoders_path = self.output_dir / f"label_encoders_{self.timestamp}.pkl"
-        joblib.dump(self.label_encoders, encoders_path)
+date_cols = ['start_date', 'completion_date', 'primary_completion_date']
+for d in date_cols:
+    if d in df.columns:
+        df[f"{d}_year"] = pd.to_datetime(df[d], errors='coerce').dt.year.fillna(2020)
 
-        print(f"✅ Preprocessed data saved: {output_path}")
-        print(f"✅ Label encoders saved: {encoders_path}")
-        return output_path
+categorical = [
+    'study_type', 'phases', 'allocation', 'intervention_model',
+    'masking', 'primary_purpose', 'gender', 'lead_sponsor_class'
+]
+label_encoders = {}
+for col in categorical:
+    if col in df.columns:
+        df[col] = df[col].fillna('Unknown')
+        le = LabelEncoder()
+        df[f"{col}_encoded"] = le.fit_transform(df[col].astype(str))
+        label_encoders[col] = le
+
+# 4. Derived features
+if 'start_date_year' in df.columns and 'completion_date_year' in df.columns:
+    df['trial_duration_years'] = df['completion_date_year'] - df['start_date_year']
+    df['trial_duration_years'] = df['trial_duration_years'].clip(lower=0, upper=20)
+
+if 'phases' in df.columns:
+    df['is_multi_phase'] = df['phases'].astype(str).str.contains('\|').astype(int)
+if 'location_countries' in df.columns:
+    df['is_international'] = df['location_countries'].astype(str).str.contains('\|').astype(int)
+
+# 5. Final features
+structured = [
+    'enrollment_count', 'start_date_year', 'completion_date_year',
+    'primary_completion_date_year', 'trial_duration_years',
+    'study_type_encoded', 'phases_encoded', 'allocation_encoded',
+    'intervention_model_encoded', 'masking_encoded', 'primary_purpose_encoded',
+    'gender_encoded', 'lead_sponsor_class_encoded', 'is_multi_phase', 'is_international'
+]
+structured = [c for c in structured if c in df.columns]
+for s in structured:
+    if df[s].dtype in ['float64', 'int64']:
+        df[s] = df[s].fillna(df[s].median())
+    else:
+        df[s] = df[s].fillna(0)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+processed_csv = f"{processed_dir}/processed_clinical_trials_{timestamp}.csv"
+df.to_csv(processed_csv, index=False)
+
+# Save feature metadata and encoders
+feature_groups = {
+    'text': ['combined_text'],
+    'structured': structured,
+    'target': 'outcome',
+    'identifier': 'nct_id'
+}
+with open(f"{processed_dir}/feature_groups_{timestamp}.json", 'w') as f:
+    json.dump(feature_groups, f, indent=2)
+joblib.dump(label_encoders, f"{processed_dir}/label_encoders_{timestamp}.pkl")
+
+print("✅ Data preprocessing completed!")
+print(f"Processed CSV: {processed_csv}")
+print(f"Features Spec: {processed_dir}/feature_groups_{timestamp}.json")
+print(f"Encoders:      {processed_dir}/label_encoders_{timestamp}.pkl")
