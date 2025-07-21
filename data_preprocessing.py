@@ -6,7 +6,7 @@ from pathlib import Path
 import json
 
 class ClinicalTrialPreprocessor:
-    def __init__(self, raw_file="data/raw_clinical_trials.csv", out_dir="data/processed"):
+    def __init__(self, raw_file="data/raw_clinical_trials.csv", out_dir="/content/drive/MyDrive/clinical-trial-outcome-prediction/data/processed"):
         self.raw_file = Path(raw_file)
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
